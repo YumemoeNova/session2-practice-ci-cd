@@ -1,0 +1,78 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths: [training_data.csv]
+  pull_request:
+    branches: [main]
+    paths: [training_data.csv]
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    name: Train linear model
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Train model
+        run: python train_model.py
+      - name: Pass coefficients to the publish job
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: linear-model
+          path: linear_model.txt
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    name: Publish model
+    if: github.event_name == 'push'
+    needs: train
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: model-release
+      queue: max
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: linear-model
+      - name: Update the release branch
+        shell: bash
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin release
+          release_dir="$RUNNER_TEMP/model-release"
+          git worktree add --detach "$release_dir" FETCH_HEAD
+          cp linear_model.txt "$release_dir/linear_model.txt"
+          git -C "$release_dir" add linear_model.txt
+          if ! git -C "$release_dir" diff --cached --quiet; then
+            git -C "$release_dir" commit -m "Update linear model for v$GITHUB_RUN_NUMBER"
+            git -C "$release_dir" push origin HEAD:refs/heads/release
+          fi
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="v$GITHUB_RUN_NUMBER"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" linear_model.txt --clobber
+          else
+            gh release create "$tag" linear_model.txt --target "$GITHUB_SHA" \
+              --title "Release $tag" --notes "Automated model training release."
+          fi
